@@ -151,7 +151,7 @@ streamlit run menu.py
 
 在条目批量分析界面输入 demo，可查看演示数据。本地模型路径可在 `utils/inference_vllm.py` 中自定义。
 
-### 1. 单条评论分析
+### 1. 单条评论分析 
 
 ![single_example](figs/single_example.png)
 
