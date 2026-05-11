@@ -153,7 +153,7 @@ streamlit run menu.py
 
 ### 1. 单条评论分析
 
-![single_example](figs\single_example.png)
+![single_example](figs/single_example.png)
 
 输入一段评论后，系统会实时给出分析结果。
 
