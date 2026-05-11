@@ -1,25 +1,25 @@
-import streamlit as st
-import json
-import plotly.graph_objects as go
-import json_repair
-from utils.inference_vllm import load_vllm_model, model_path_CoT, model_path_noCoT, schema_CoT, schema_noCoT
-from openai import OpenAI
-from vllm import LLM, SamplingParams
-from transformers import AutoTokenizer
-from vllm.sampling_params import GuidedDecodingParams
 import datetime
+import streamlit as st
+from openai import OpenAI
+from transformers import AutoTokenizer
+from vllm import SamplingParams
 
-cached_path = "./cached_subject"
-subject_path = "./jsons"
-PROMPT = "你是一个精通 ACG 文化的影评分析专家。你的任务是分析用户的 Bangumi 评论及其情感倾向，并将其转化为符合以下定义的 JSON 格式。\n\n 输出要求:\n1. 必须严格遵守 JSON 语法，输出原始、紧凑的 JSON，不要输出 markdown 代码块（```json）。\n2. JSON 必须包含以下字段:\n - \"glossary\": {\"术语名\": \"解释\"}。如果评论中包含 ACG 行话或术语（如 \"神回\"、\"暴死\"），请在此解释；否则为空对象。\n - \"step_by_step_analysis\": 字符串。请先分析评论中提到的黑话，再结合 \"虽然... 但是...\" 等逻辑，分析评论中表达出对于剧情、作画、音乐、角色等维度的优缺点评价。\n - \"aspects\": 对象。包含 \"story\", \"visual\", \"music\",\"character\" 四个键，值为 \"Positive\", \"Negative\", \"Neutral\" 或 \"Not Mentioned\"。\n - \"final_sentiment\": 字符串。整体评价，仅限 \"Positive\", \"Neutral\", \"Negative\"。\n - \"confidence\": 整数。1-10，表示你对该判断的置信度。\n\n 注意：先进行分析（step_by_step_analysis），再给出结论。不要编造用户未提到的观点。\n\n"
-PROMPT_CoT =  "你是一个精通 ACG 文化的影评分析专家。你的任务是分析用户的 Bangumi 评论及其情感倾向，并将其转化为符合以下定义的 JSON 格式。\n\n 输出要求:\n1. 必须严格遵守 JSON 语法，输出原始、紧凑的 JSON，不要包含任何空格或缩进，不要输出 markdown 代码块（```json），输出以{开头，字符串以英文双引号开头，且务必输出对应的双引号结尾。\n2. JSON 必须包含以下字段:\n - \"glossary\": {\"术语名\": \"解释\"}。如果评论中包含 ACG 行话或术语（如 \"神回\"、\"暴死\"），请在此解释；否则为空对象。\n - \"step_by_step_analysis\": 字符串。请先分析评论中提到的黑话，再结合 \"虽然... 但是...\" 等逻辑，分析评论中表达出对于剧情、作画、音乐、角色等维度的优缺点评价。\n - \"aspects\": 对象。包含 \"story\", \"visual\", \"music\",\"character\" 四个键，值为 \"Positive\", \"Negative\", \"Neutral\" 或 \"Not Mentioned\"。\n - \"final_sentiment\": 字符串。整体评价，仅限 \"Positive\", \"Neutral\", \"Negative\"。\n - \"confidence\": 整数。1-10，表示你对该判断的置信度。\n\n 注意：先进行分析（step_by_step_analysis），再给出结论。不要编造用户未提到的观点。\n\n"
-aspects_ch = {"story": "剧情", "visual": "画面", "music": "音乐", "character": "角色", "final_sentiment": "总评价"}
+from single_comment_config import ASPECTS_CH, DEFAULT_FALLBACK_STRATEGY, PROMPT
+from single_comment_rag import (
+    build_comment_context,
+    normalize_source_title,
+    parse_json_response,
+    run_agentic_rag_analysis,
+)
+from utils.inference_vllm import load_vllm_model, model_path_CoT, model_path_noCoT
+
 
 def display_analysis(data):
-    """展示单条分析结果（不包含外层标题，适用于当前结果和历史记录）"""
+    if data.get("source_title"):
+        st.caption(f"🎬 来源作品: {data['source_title']}")
     st.markdown("**维度评分：**")
     cols = st.columns(5)
-    aspect_map = data['aspects'].copy()
+    aspect_map = data["aspects"].copy()
     aspect_map["final_sentiment"] = data.get("final_sentiment", "Not Mentioned")
     color_map = {"Positive": "🟢", "Negative": "🔴", "Neutral": "⚪", "Not Mentioned": "⚫"}
     aspect_keys = ["visual", "story", "character", "music"]
@@ -28,180 +28,284 @@ def display_analysis(data):
         val = aspect_map.get(aspect_key, "Not Mentioned").capitalize()
         icon = color_map.get(val, "⚫")
         with cols[idx]:
-            st.markdown(f"{aspects_ch[aspect_key]}")
+            st.markdown(f"{ASPECTS_CH[aspect_key]}")
             st.caption(f"{icon} {val}")
-    # 最后一个列显示总评价
+
     val = aspect_map.get("final_sentiment", "Not Mentioned").capitalize()
     icon = color_map.get(val, "⚫")
     with cols[-1]:
-        st.markdown(f"{aspects_ch['final_sentiment']}")
+        st.markdown(f"{ASPECTS_CH['final_sentiment']}")
         st.caption(f"{icon} {val}")
 
-    # 如果是 CoT 模式，额外显示术语和思维链
-    if 'glossary' in data:
-        if data.get('glossary'):
+    if "glossary" in data:
+        if data.get("glossary"):
             st.markdown("**📖 术语识别：**")
-            for term, desc in data['glossary'].items():
+            for term, desc in data["glossary"].items():
                 st.success(f"**{term}**: {desc}")
         st.markdown("**🧠 深度思维链分析：**")
-        st.markdown(f"> {data['analysis']}")
+        st.markdown(f"> {data.get('analysis', '暂无分析')}")
 
     st.caption(f"🤖 模型置信度: {data['confidence']}/10")
 
-def analyze_comment(comment, model, with_CoT=False, api_key=None):
-    prompt = PROMPT_CoT if with_CoT == "分析模式" else PROMPT
-    if model == "在线":
-        with st.spinner("在线调用模型分析中..."):
-            try:
-                client = OpenAI(
-                    api_key=api_key,
-                    base_url="https://api.deepseek.com",
-                )
-                response = client.chat.completions.create(
-                    model="deepseek-reasoner",
-                    messages=[
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": comment}
-                    ],
-                    response_format={'type': 'json_object'},
-                    stream=False
-                )
-                # 解析结果并更新output
-                res_content = response.choices[0].message.content
-            except Exception as e:
-                st.error(f"调用在线模型失败: {e}")
-                return None
-            try:
-                res_json = json.loads(res_content)
-            except json.JSONDecodeError:
-                st.error("解析模型输出失败，可能是模型没有正确遵守输出格式要求，请重试。")
-                return None
-    else:
-        model_path = model_path_CoT if with_CoT == "分析模式" else model_path_noCoT
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        llm = load_vllm_model(model_path)
-        messages = [
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": comment}
-        ]
-        # 生成模型输入的 prompt 字符串
-        prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True
+
+class BaseLLM:
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        force_json: bool = False,
+    ) -> str:
+        raise NotImplementedError
+
+    def chat_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        fallback: dict,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+    ) -> dict:
+        raw = self.chat(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            force_json=True,
         )
-        
-        # 根据是否启用 CoT 选择 JSON schema
-        schema = schema_CoT if with_CoT == "分析模式" else schema_noCoT
-        
-        # 设置 guided decoding 参数
-        guided_decoding_params = GuidedDecodingParams(json=schema)
-        sampling_params = SamplingParams(
-            temperature=0.7,
-            top_p=0.9,
-            max_tokens=2048,
-            guided_decoding=guided_decoding_params
-        )
-        
-        # 执行推理（使用 spinner 提供用户反馈）
-        with st.spinner("本地模型推理中..."):
-            try:
-                outputs = llm.generate([prompt_text], sampling_params)
-                generated_text = outputs[0].outputs[0].text
-            except Exception as e:
-                st.error(f"本地模型推理失败: {e}")
-                return None
-        
-        # 解析 JSON 输出
         try:
-            res_json = json.loads(generated_text)
-        except json.JSONDecodeError:
-            st.error("模型输出不是有效的 JSON，可能未遵守输出格式要求。")
-            return None
-    
-    if with_CoT == "分析模式":
+            return parse_json_response(raw)
+        except Exception:
+            return fallback
+
+
+class OnlineLLM(BaseLLM):
+    def __init__(self, api_key: str):
+        self.client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        force_json: bool = False,
+    ) -> str:
+        kwargs = {"stream": False, "reasoning_effort": "high"}
+        if force_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = self.client.chat.completions.create(
+            model="deepseek-v4-pro",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            **kwargs,
+        )
+        return response.choices[0].message.content or ""
+
+
+@st.cache_resource
+def load_tokenizer(path: str):
+    return AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+
+
+class VllmLLM(BaseLLM):
+    def __init__(self, model_path: str):
+        self.tokenizer = load_tokenizer(model_path)
+        self.llm = load_vllm_model(model_path)
+
+    def chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.2,
+        force_json: bool = False,
+    ) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        try:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        except TypeError:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=0.9,
+            max_tokens=max_new_tokens,
+        )
+        outputs = self.llm.generate([prompt_text], sampling_params)
+        return outputs[0].outputs[0].text.strip()
+
+
+def analyze_plain_comment(llm: BaseLLM, comment: str, source_title: str = "") -> dict:
+    fallback = {
+        "glossary": {},
+        "step_by_step_analysis": "模型输出解析失败，未能生成详细分析。",
+        "aspects": {
+            "story": "Not Mentioned",
+            "visual": "Not Mentioned",
+            "music": "Not Mentioned",
+            "character": "Not Mentioned",
+        },
+        "final_sentiment": "Neutral",
+        "confidence": 5,
+    }
+    user_prompt = build_comment_context(comment, source_title)
+    return llm.chat_json(PROMPT, user_prompt, fallback=fallback, max_new_tokens=900, temperature=0.2)
+
+
+def analyze_comment(
+    comment: str,
+    model: str,
+    with_CoT=False,
+    api_key: str = "",
+    fallback_strategy: str = DEFAULT_FALLBACK_STRATEGY,
+    tavily_api_key: str = "",
+    source_title: str = "",
+):
+    is_rag_mode = with_CoT == "分析模式"
+    normalized_source_title = normalize_source_title(source_title)
+
+    try:
+        if model == "在线":
+            llm: BaseLLM = OnlineLLM(api_key=api_key)
+            spinner_text = "在线模型分析中..."
+        else:
+            model_path = model_path_CoT if is_rag_mode else model_path_noCoT
+            llm = VllmLLM(model_path)
+            spinner_text = "本地 vLLM 模型分析中..."
+
+        with st.spinner(spinner_text):
+            if is_rag_mode:
+                res_json = run_agentic_rag_analysis(
+                    llm=llm,
+                    comment=comment,
+                    source_title=normalized_source_title,
+                    fallback_strategy=fallback_strategy,
+                    tavily_api_key=tavily_api_key,
+                )
+            else:
+                res_json = analyze_plain_comment(llm, comment, normalized_source_title)
+    except Exception as exc:
+        st.error(f"分析失败: {exc}")
+        return None
+
+    if is_rag_mode:
         sample_data = {
             "raw_text": comment,
+            "source_title": normalized_source_title,
             "analysis": res_json.get("step_by_step_analysis", "暂无分析"),
             "glossary": res_json.get("glossary", {}),
             "aspects": res_json.get("aspects", {}),
             "confidence": res_json.get("confidence", 0),
-            "final_sentiment": res_json.get("final_sentiment", "Unknown")
+            "final_sentiment": res_json.get("final_sentiment", "Unknown"),
         }
     else:
         sample_data = {
             "raw_text": comment,
+            "source_title": normalized_source_title,
             "aspects": res_json.get("aspects", {}),
             "confidence": res_json.get("confidence", 0),
-            "final_sentiment": res_json.get("final_sentiment", "Unknown")
+            "final_sentiment": res_json.get("final_sentiment", "Unknown"),
         }
+
     st.subheader("分析结果")
     display_analysis(sample_data)
     return sample_data
 
 
-
 if __name__ == "__main__":
     st.set_page_config(page_title="Bangumi 评论分析系统", layout="wide")
-    if 'history' not in st.session_state:
+    if "history" not in st.session_state:
         st.session_state.history = []
 
     st.title("单条评论分析")
-    st.markdown("输入评论，综合分析评论的情感倾向。")
+    st.markdown("输入评论，综合分析评论的情感倾向。勾选“分析模式”时会启用 RAG。")
 
     with st.form("input_form"):
-        # 第一行：评论输入框（多行文本）
         comment = st.text_area(
             "评论内容",
             placeholder="请输入要分析的评论...",
             height=150,
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
 
-        # 第二行：模型选择、分析模式、API Key 并排
-        col1, col2, col3 = st.columns([2, 2, 3])  # 调整列宽比例，API Key 稍宽
-        model = col1.selectbox(
-            "模型选择",
-            ["本地", "在线"],
-            label_visibility="collapsed"
-        )
+        col1, col2, col3 = st.columns([2, 2, 3])
+        model = col1.selectbox("模型选择", ["本地", "在线"], label_visibility="collapsed")
         with_CoT = col2.pills(
             "是否启用CoT",
             ["分析模式"],
             selection_mode="single",
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
-        api_key = col3.text_input(
-            "API Key",
-            placeholder="选择在线模式时请输入 API Key",
-            label_visibility="collapsed"
+        fallback_strategy = col3.selectbox(
+            "Fallback Strategy",
+            ["先进行全文搜索再进行网页搜索", "先进行网页搜索再进行全文搜索", "只进行全文搜索", "只进行网页搜索"],
+            index=0,
+            label_visibility="collapsed",
         )
 
-        # 提交按钮（宽度自适应）
+        col4, col5, col6 = st.columns([3, 3, 3])
+        source_title = col4.text_input(
+            "来源作品名",
+            placeholder="可选：输入评论对应的番剧/作品名",
+            label_visibility="collapsed",
+        )
+        api_key = col5.text_input(
+            "API Key",
+            placeholder="选择在线模式时请输入 DeepSeek API Key",
+            label_visibility="collapsed",
+        )
+        tavily_api_key = col6.text_input(
+            "Tavily API Key",
+            placeholder="Tavily Key（为空或无效时自动回退到 ddgs）",
+            label_visibility="collapsed",
+            type="password",
+        )
+
         submitted = st.form_submit_button("🔍 分析", use_container_width=True)
-        
-           
+
         if submitted:
             if not comment.strip():
                 st.warning("请输入评论内容后再提交分析。")
             elif model == "在线" and not api_key.strip():
-                st.warning("请选择在线模式时请输入 API Key。")
+                st.warning("在线模式需要输入 API Key。")
             else:
-                result = analyze_comment(comment, model=model, with_CoT=with_CoT, api_key=api_key)
-                if result is not None:   # 分析成功
-                    result['timestamp'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                result = analyze_comment(
+                    comment,
+                    model=model,
+                    with_CoT=with_CoT,
+                    api_key=api_key,
+                    fallback_strategy=fallback_strategy,
+                    tavily_api_key=tavily_api_key,
+                    source_title=source_title,
+                )
+                if result is not None:
+                    result["timestamp"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     st.session_state.history.append(result)
+
+        st.caption("说明：只有勾选“分析模式”时才会启用 RAG；Tavily Key 为空或不可用时，网页补召回会自动回退到 ddgs。")
         st.markdown("---")
         st.subheader("📜 历史分析记录")
 
         if not st.session_state.history:
             st.info("暂无历史记录")
         else:
-            # 倒序显示（最新的在上）
-            for idx, item in enumerate(reversed(st.session_state.history)):
-                # 截断评论作为标题
-                short_comment = item['raw_text'][:50] + "..." if len(item['raw_text']) > 50 else item['raw_text']
+            for item in reversed(st.session_state.history):
+                short_comment = item["raw_text"][:50] + "..." if len(item["raw_text"]) > 50 else item["raw_text"]
                 with st.expander(f"{item['timestamp']} - {short_comment}"):
-                    # 在 expander 内部直接调用 display_analysis，不再加额外标题
                     display_analysis(item)
-

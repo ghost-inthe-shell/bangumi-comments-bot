@@ -36,7 +36,7 @@ async def get_response_with_retry(entry, semaphore, client, instruction):
             try:
                 # 2. 异步调用DeepSeek API（核心修改：加await）
                 response = await client.chat.completions.create(
-                    model="deepseek-reasoner",
+                    model="deepseek-v4-pro",
                     messages=[
                         {"role": "system", "content": instruction},
                         {"role": "user", "content": input_content}

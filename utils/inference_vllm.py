@@ -6,8 +6,8 @@ import streamlit as st
 
 # 配置路径和参数
 
-model_path_CoT = "/model/Qwen-awq-4bit"
-model_path_noCoT = "/model/Qwen-merged-nocot-awq"
+model_path_CoT = "/root/autodl-tmp/qwen_checkpoints/Qwen-cot-awq"
+model_path_noCoT = "/root/autodl-tmp/qwen_checkpoints/Qwen-nocot-awq"
 
 # json schema 定义（分析模式 vs 非分析模式）
 
